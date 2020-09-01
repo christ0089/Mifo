@@ -1,6 +1,5 @@
 import * as functions from "firebase-functions";
 import * as admin from "firebase-admin";
-//import * as stripe from "stripe";
 
 admin.initializeApp({
   credential: admin.credential.applicationDefault(),
@@ -8,15 +7,15 @@ admin.initializeApp({
   storageBucket: "mifo-33ee4.appspot.com",
 });
 
-const db = admin.firestore();
-
 const { BigQuery } = require("@google-cloud/bigquery");
-
-const fs = require("fs-extra");
+const { Parser } = require("json2csv");
+const db = admin.firestore();
+const fs_extra = require("fs-extra");
+const fs = require("fs");
 const path = require("path");
 const os = require("os");
+const csv = require("csv-parser");
 
-const { Parser } = require("json2csv");
 const cors = require("cors")({
   origin: true,
 });
@@ -33,83 +32,82 @@ enum USER_STATUS {
   DISABLED,
 }
 
-exports.UserCreated = functions.auth.user().onCreate(async (user) => {
-  const firebaseUID = user.uid;
-  const email: string = user.email as string;
-  const domain = email.slice(email.indexOf("@"));
-  const domainData = await db
-    .collection(`Domaines`)
-    .where("domain", "==", domain)
-    .get();
-
-  if (domainData.empty === true) {
-    await db.collection("Domaines").add({
-      domain: domain,
-      admin: [firebaseUID],
-    });
-
-    return db.doc(`users/${firebaseUID}`).update({
-      role: USER_ROLE.DEV_OPERATOR,
-      user_state: USER_STATUS.PENDING,
-    });
-  }
-
-  if (domain === "tenmas") {
-    return db.doc(`users/${firebaseUID}`).update({
-      role: USER_ROLE.OPERATOR,
-      user_state: USER_STATUS.PENDING,
-    });
-  }
-
-  return db.doc(`users/${firebaseUID}`).update({
-    role: USER_ROLE.DEV_ADMIN,
-    user_state: USER_STATUS.PENDING,
-  });
-});
-
 // interface IUser {
 //   name : string;
 //   email: string;
 // }
 
-exports.UserCreation = functions.firestore
-  .document("users/{id}")
-  .onCreate((snap, context) => {
-    const id = context.params.id;
-    const data: any = snap.data();
-    console.log(data);
+exports.userCreation = functions.https.onCall((data, context) => {
+  const email = data.email;
+  const domain = email.slice(email.indexOf("@") + 1, email.indexOf("."));
+  const domainData = db
+    .collection(`Domaines`)
+    .where("domain", "==", domain)
+    .get();
 
-    const promises: any[] = [];
-
-    admin
-      .auth()
-      .getUserByEmail(data.email)
-      .then((user) => {
-        if (user === null) {
-          const user_state = admin.auth().createUser({
-            email: data.email,
-            displayName: data.name,
-            password: "tenmas",
-            emailVerified: false,
-          });
-          promises.push(user_state);
-        }
-        return;
-      })
-      .catch((e) => {
-        console.error(e);
-      });
-
-    return Promise.all(promises)
-      .then((message: any[]) => {
-        return db.collection(`users`).doc(id).update({
-          user: message[0].uid,
-        });
-      })
-      .catch((e: Error) => {
-        console.log(e);
-      });
+  const user_state = admin.auth().createUser({
+    email: data.email,
+    displayName: data.name,
+    password: data.password,
+    emailVerified: false,
   });
+  let domainDataArr = true;
+  return Promise.all([user_state, domainData])
+    .then((user) => {
+      domainDataArr = user[1].empty;
+      return {
+        email: user[0].email,
+        name: user[0].displayName,
+        user: user[0].uid,
+        createdAt: admin.firestore.Timestamp.now(),
+      };
+    })
+    .then((object) => {
+      if (domainDataArr === true) {
+        const domainAdd = db.collection("Domaines").add({
+          domain: [domain],
+          admin: [object.user],
+        });
+
+        const createDataset = createDatasetIfNotExists(domain);
+        const createTablePromise = createTable(domain, "credits");
+
+        const createAdmin = db.collection(`users`).add({
+          domain: [domain],
+          user_role: USER_ROLE.DEV_ADMIN,
+          user_state: USER_STATUS.PENDING,
+          ...object,
+        });
+        return Promise.all([domainAdd, createDataset, createTablePromise])
+          .then(() => {
+            return createAdmin;
+          })
+          .catch((e) => {
+            console.log(e);
+          });
+      }
+
+      if (domain === "tenmas") {
+        return db.collection(`users`).add({
+          domain: [domain],
+          user_role: USER_ROLE.OPERATOR,
+          user_state: USER_STATUS.PENDING,
+          ...object,
+        });
+      }
+
+      return db.collection("users").add({
+        domain: [domain],
+        user_role: USER_ROLE.DEV_OPERATOR,
+        user_state: USER_STATUS.PENDING,
+        ...object,
+      });
+    })
+    .catch((e) => {
+      console.error(e);
+    });
+});
+
 
 exports.CreditCreation = functions.firestore
   .document("credits/{id}")
@@ -129,6 +127,8 @@ exports.CreditCreation = functions.firestore
         }),
         domain: ["tenmas", ...data.domain],
         status: 0,
+        phase: 0,
+        confronta: {},
       });
     const notify = admin
       .firestore()
@@ -148,9 +148,25 @@ exports.CreditCreation = functions.firestore
         createdAt: admin.firestore.Timestamp.now(),
       });
 
-    const query = insertCredit(data.domain[0], "credit", data);
+    const query_0 = insertCredit(data.domain[0], "credits", {
+      key: id,
+      operator: JSON.parse(data.dev_operator).key || "",
+      operator_name: JSON.parse(data.dev_operator).name || "",
+      phase: 0,
+      completed: false,
+      ...data,
+    });
 
-    const promises: any[] = [credit_update, notify, query];
+    const query_1 = insertCredit("tenmas", "credits", {
+      key: id,
+      operator: JSON.parse(data.tenmas_operator).key || "",
+      operator_name: JSON.parse(data.tenmas_operator).name || "",
+      phase: 0,
+      completed: false,
+      ...data,
+    });
+
+    const promises: any[] = [credit_update, notify, query_0, query_1];
 
     return Promise.all(promises)
       .then((message: any) => {
@@ -163,29 +179,72 @@ exports.CreditCreation = functions.firestore
 
 exports.CreditUpdate = functions.firestore
   .document("credits/{id}")
-  .onUpdate((snap, context) => {
+  .onUpdate(async (snap, context) => {
     const id = context.params.id;
     const beforeDoc = snap.before.data();
     const afterDoc = snap.after.data();
-
-    if (beforeDoc.status === afterDoc.status) {
+    const tenmas_operator = JSON.parse(afterDoc.tenmas_operator).key || null;
+    const dev_operator = JSON.parse(afterDoc.tenmas_operator).key || null;
+    console.log(tenmas_operator);
+    console.log(beforeDoc.tenmas_operator !== afterDoc.tenmas_operator);
+    if (tenmas_operator === null) {
       return;
     }
+
     const promises: any[] = [];
-    
+
+    if (beforeDoc.tenmas_operator !== afterDoc.tenmas_operator) {
+      //   const check_conv = await admin
+      //     .database()
+      //     .ref()
+      //     .child(`conversations/${dev_operator}`)
+      //     .once("child_added");
+      //   console.log(check_conv.exists())
+      //   if (check_conv.exists() === true) {
+      //     const tenmas = admin
+      //       .database()
+      //       .ref()
+      //       .child(`conversations/${dev_operator}`)
+      //       .update({
+      //         operatorName: JSON.parse(afterDoc.tenmas_operator).name || "",
+      //       });
+      //     const convData = await admin
+      //       .database()
+      //       .ref()
+      //       .child(`conversations/${dev_operator}`)
+      //       .once("child_changed");
+      //     const newConv = admin
+      //       .database()
+      //       .ref()
+      //       .child(`conversations/${tenmas_operator}/${convData.key}`)
+      //       .set(convData.val());
+
+      //     promises.push(tenmas);
+      //     promises.push(newConv);
+      //   }
+      const query_1 = updateCredit("tenmas", afterDoc.number, {
+        operator: JSON.parse(afterDoc.tenmas_operator).key || "",
+        operator_name: JSON.parse(afterDoc.tenmas_operator).name || "",
+        phase: afterDoc.phase || 0,
+        completed: afterDoc.completed || false,
+        ...afterDoc,
+      });
+      promises.push(query_1);
+    }
+
     if (afterDoc.status === 3) {
       const notify = admin
         .firestore()
         .collection(`notifications`)
         .add({
           domain: ["tenmas", ...afterDoc.domain],
-          owner: afterDoc.owner,
-          operator: afterDoc.operator,
+          owner: dev_operator.key,
+          operator: tenmas_operator.key,
           viewed_by_owner: false,
           viewed_by_admin: false,
           viewed_by_operator: false,
           viewed_by_super_admin: false,
-          priority: 0,
+          priority: afterDoc.status,
           options: {
             credit_id: id,
           },
@@ -194,8 +253,27 @@ exports.CreditUpdate = functions.firestore
       promises.push(notify);
     }
 
-    const query = updateCredit(afterDoc.domain[0], "credit", snap.after.data());
-    promises.push(query);
+    // Check that there was a change in the phase
+    if (beforeDoc.phase < afterDoc.phase && beforeDoc.phase !== null) {
+      const query_0 = updateCredit(afterDoc.domain[1], afterDoc.number, {
+        operator: JSON.parse(afterDoc.dev_operator).key || "",
+        operator_name: JSON.parse(afterDoc.dev_operator).name || "",
+        phase: afterDoc.phase || 0,
+        completed: afterDoc.completed || false,
+        ...afterDoc,
+      });
+
+      const query_1 = updateCredit("tenmas", afterDoc.number, {
+        operator: JSON.parse(afterDoc.tenmas_operator).key || "",
+        operator_name: JSON.parse(afterDoc.tenmas_operator).name || "",
+        phase: afterDoc.phase || 0,
+        completed: afterDoc.completed || false,
+        ...afterDoc,
+      });
+
+      promises.push(query_0);
+      promises.push(query_1);
+    }
 
     return Promise.all(promises)
       .then((message: any) => {
@@ -207,11 +285,34 @@ exports.CreditUpdate = functions.firestore
   });
 
 // Notify when Assigned to operator
+function creditType(idx: number) {
+  const type = ["Tradicional", "Conyugal", "Pensionado", "Mancomunado"];
+  return type[idx];
+}
 
+function creditPhase(phase: string) {
+  const creditSteps = [
+    "GENERACION DE EXPEDIENTE",
+    "ASIGNACION DE VIVIENDA",
+    "SUPERVISION TECNICA",
+    "VERIFICACION FINAL DE IMPORTES",
+    "INSTRUCCION NOTARIAL (FECHA DE FIRMA)",
+    "RESULTADO DE FIRMA DE ESCRITURAS",
+    "SOLICITUD DE RECURSOS",
+    "ASIGNACION DE RECURSOS",
+    "PAGO A VENDEDOR",
+    "FASES DE PAGO TERMINADAS",
+    "EXPEDIENTE COMPLETO Y EN CUSTODIA",
+  ];
+  const idx = creditSteps.indexOf(phase);
+  return idx > -1 ? idx : 0;
+}
 export const createCSV = functions.firestore
   .document("reports/{reportId}")
   .onCreate((snap, context) => {
     // Step 1. Set main variables
+
+    const data = snap.data();
 
     const reportId = context.params.reportId;
     const fileName = `reports/${reportId}.csv`;
@@ -223,9 +324,29 @@ export const createCSV = functions.firestore
     // Reference Storage Bucket
     const storage = admin.storage().bucket(); // or set to env variable
 
+    let query = db.collection("credits") as FirebaseFirestore.Query<
+      FirebaseFirestore.DocumentData
+    >;
+
+    if (data.operator !== "") {
+      if (data.domain[0] === "tenmas") {
+        query = query.where("tenmas_operator", "==", data.operator);
+      } else {
+        query = query.where("dev_operator", "==", data.operator);
+      }
+    }
+
+    if (data.fraccionamiento !== "") {
+      query = query.where("fraccionamiento", "==", data.fraccionamiento);
+    }
+
+    if (data.start_date !== "") {
+      query = query.where("createdAt", "<=", data.start_date);
+    }
+
+    query = query.where("domain", "array-contains", data.domain[0]);
     // Step 2. Query collection
-    return db
-      .collection("credits")
+    return query
       .get()
       .then((querySnapshot) => {
         /// Step 3. Creates CSV file from with orders collection
@@ -233,25 +354,32 @@ export const createCSV = functions.firestore
 
         // create array of users
         let idx = 0;
+        if (querySnapshot.size === 0) {
+          return Promise.reject("No Credits");
+        }
         querySnapshot.forEach((doc) => {
+          console.log(doc.data());
+          console.log(doc.data().tenmas_operator);
+          console.log(doc.data().dev_operator);
+          const confronta = doc.data().confronta || {};
+          const tenmas = JSON.parse(doc.data().tenmas_operator);
+          const dev = JSON.parse(doc.data().dev_operator);
+
           credits.push({
             "No.": idx,
-            EJECUTIVO: doc.data().tenmas_operator.name,
+            EJECUTIVO: tenmas.name,
             PROMOTOR: doc.data().domain[1],
-            ASESOR: JSON.parse(doc.data().dev_operator).name,
+            ASESOR: dev.name,
             "RECEP. EXP. POR TEN MAS": doc.data().createdAt.toDate(),
             VIVIENDA: doc.data().house_type === 0 ? "NUEVA" : "USADA",
             "NO. DE SOLICITUD": doc.data().number,
             ACREDITADO: doc.data().name,
-            "TIPO DE CREDITO": doc.data().status,
-            "FASE ACTUALIZADA": "",
-            "OBSERVACION DE ACLARACION": "",
-            CUV: "",
-            "OBSERVACION DE EXPEDIENTE DE CREDITO": "",
+            "TIPO DE CREDITO": creditType(doc.data().credit_type),
+            "FASE ACTUALIZADA": confronta.Phase || "",
+            CUV: confronta.CUV || "",
             "FECHA DE FIRMA ACREDITADO": "",
             "ENTREGADO A MESA DE CONTROL": "",
-            DESVIACIONES: "",
-            "FECHA RECEPCION DE DESVIACION ": "",
+            "Monto a Pagar": confronta.MontoFactura,
           });
           idx++;
         });
@@ -262,9 +390,9 @@ export const createCSV = functions.firestore
 
         return parser.parse(credits);
       })
-      .then((csv) => {
+      .then((_csv) => {
         // Step 4. Write the file to cloud function tmp storage
-        return fs.outputFile(tempFilePath, csv);
+        return fs_extra.outputFile(tempFilePath, _csv);
       })
       .then(() => {
         // Step 5. Upload the file to Firebase cloud storage
@@ -281,7 +409,70 @@ export const createCSV = functions.firestore
       .then((url) => {
         return reportRef.update({ status: "completado", url: url });
       })
-      .catch((err) => console.log(err));
+      .catch(async (err) => {
+        await reportRef.update({ status: "error" }).catch((e) => {
+          console.log(e);
+        });
+        console.log(err);
+      });
+  });
+
+exports.generateThumbnail = functions.storage
+  .object()
+  .onFinalize(async (object) => {
+    const fileBucket = object.bucket; // The Storage bucket that contains the file.
+    const filePath = object.name as string; // File path in the bucket.
+
+    if (!filePath.startsWith("Confronta/")) {
+      return;
+    }
+
+    const fileName = path.basename(filePath);
+
+    const bucket = admin.storage().bucket(fileBucket);
+    const tempFilePath = path.join(os.tmpdir(), fileName);
+
+    await bucket.file(filePath).download({ destination: tempFilePath });
+
+    const creditData = await db.collection("credits").get();
+
+    const credits: any[] = [];
+    const promises: Promise<FirebaseFirestore.WriteResult>[] = [];
+
+    fs.createReadStream(tempFilePath)
+      .pipe(csv())
+      .on("data", (row: any) => {
+        console.log(row["No Solicitud"]);
+        console.log(row["Monto a Ejercer Titular"]);
+        const confronta = {
+          key: row["No Solicitud"],
+          CUV: row["CUV"],
+          MontoFactura: row["Monto a Ejercer Titular"],
+          Phase: row["Fase"],
+          PhaseNo: creditPhase(row["Fase"]),
+        };
+        credits.push(confronta);
+      })
+      .on("end", () => {
+        console.log("CSV file successfully processed");
+
+        credits.forEach((credit) => {
+          console.log(credit.key);
+          const idx = creditData.docs.findIndex(
+            (x) => `'${x.data().number}` === credit.key
+          );
+          if (idx > -1) {
+            const id = creditData.docs[idx].id;
+            console.log(credit);
+            const update = db
+              .collection("credits")
+              .doc(id)
+              .update({ phase: credit.PhaseNo, confronta: credit });
+            promises.push(update);
+          }
+        });
+        return Promise.all(promises);
+      });
   });
 
 async function createDatasetIfNotExists(datasetName: any) {
@@ -359,24 +550,51 @@ exports.bigQSqlQuery = functions.https.onRequest(async (req, res) => {
 function createTable(dataSet: string, name: String) {
   const w = `
   CREATE TABLE IF NOT EXISTS ${dataSet}.${name} 
-  (No STRING, UID STRING, Operator STRING, Creditor STRING, Tenmas_Operator STRING, cur_phase : INT64, completed: BOOLEAN, createAt TIMESTAMP, updatedAt TIMESTAMP)`;
+  (CREDIT_ID STRING, UID STRING, Operator STRING, Operator_name STRING, Creditor STRING, cur_phase INT64, completed BOOLEAN, createAt TIMESTAMP, updatedAt TIMESTAMP)`;
   return executeQuery(w);
 }
 
 function insertCredit(dataSet: string, name: string, data: any) {
+  console.log(
+    `'${data.number}', '${data.key}', '${data.operator}', '${data.name}', '${data.operator_name}', ${data.phase}, ${data.completed}, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()`
+  );
   const q = `
   INSERT INTO ${dataSet}.${name}
-  (No, UID, Operator, Creditor, Tenmas_Operator, cur_phase, completed,  createAt, updatedAt)
-  VALUES ('${data.number}', '${data.key}', ${data.owner}, ${data.name}, ${data.tenmas}, ${data.status}, ${data.completed}, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP())`;
+          (CREDIT_ID, UID, Operator, Operator_name, Creditor, cur_phase, completed,  createAt, updatedAt)
+  VALUES  ('${data.number}', '${data.key}', '${data.operator}', '${data.operator_name}', '${data.name}', ${data.phase}, ${data.completed}, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP())`;
   console.log(q);
   return executeQuery(q);
 }
 
-function updateCredit(dataSet: string, name: string, data: any) {
-  const q = `
-  UPDATE INTO ${dataSet}.${name}
-  (Tenmas_Operator, cur_phase, completed, updatedAt)
-  VALUES ('${data.tenmas}', '${data.status}', ${data.completed}, CURRENT_TIMESTAMP())`;
-  console.log(q);
-  return executeQuery(q);
+function updateCredit(dataSet: string, credit: string, data: any) {
+  if (data.operator == "") {
+    const q_0 = `
+    UPDATE ${dataSet}.credits
+    SET cur_phase = ${data.phase}, updatedAt = CURRENT_TIMESTAMP()
+    Where CREDIT_ID = '${credit}'`;
+    console.log(q_0);
+    return executeQuery(q_0);
+  }
+  const q_1 = `
+  UPDATE ${dataSet}.credits
+  SET cur_phase = ${data.phase}, updatedAt = CURRENT_TIMESTAMP(), Operator = '${data.operator}', Operator_name = '${data.operator_name}'
+  Where CREDIT_ID = '${credit}'`;
+  console.log(q_1);
+  return executeQuery(q_1);
 }
+
+exports.activate = functions.https.onRequest((req, res) => {
+  admin
+    .auth()
+    .updateUser("vZgZKMy6pDW4yxGhnMYMAo1nOdB2", {
+      emailVerified: true,
+    })
+    .then(() => {
+      console.log("Finished");
+      return res.status(200);
+    })
+    .catch((e) => {
+      console.log(e);
+      return res.status(400);
+    });
+});
